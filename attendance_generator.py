@@ -9,6 +9,12 @@ import csv
 import io
 import json
 from tkcalendar import DateEntry
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
 # Global variables
 emp_file = ""
@@ -819,6 +825,256 @@ def generate_report():
         messagebox.showerror("Error", f"Report generation failed: {str(e)}")
 
 
+def generate_print_report():
+    """Generate a printer-friendly PDF report in A4 landscape mode"""
+    global employee_df
+
+    if employee_df is None:
+        messagebox.showerror("Error", "Please load employee data first (from Employee tab)")
+        return
+
+    att = get_attendance_data()
+    if att is None:
+        messagebox.showerror("Error", "Please upload attendance data first (from Upload tab)")
+        return
+
+    rtype = report_type_var.get()
+    emp = employee_df.copy()
+    emp = emp[['emp_id', 'name', 'Dept']]
+    emp['emp_id'] = emp['emp_id'].astype(str)
+
+    try:
+        if rtype == "Employee Wise":
+            selected_emp = emp_select_var.get()
+            if not selected_emp:
+                messagebox.showerror("Error", "Please select an employee")
+                return
+            emp_id = selected_emp.split(" - ")[0].strip()
+            emp = emp[emp['emp_id'] == emp_id]
+            start_str = gen_start_date_var.get()
+            end_str = gen_end_date_var.get()
+            if start_str and end_str:
+                start = pd.to_datetime(start_str)
+                end = pd.to_datetime(end_str)
+            else:
+                emp_att = att[att['emp_id'] == emp_id]
+                if len(emp_att) == 0:
+                    messagebox.showinfo("Info", "No attendance records for this employee")
+                    return
+                start = emp_att['date'].min()
+                end = emp_att['date'].max()
+            title = f"Attendance Report - {selected_emp}"
+
+        elif rtype == "Department Wise":
+            selected_dept = dept_select_var.get()
+            if not selected_dept:
+                messagebox.showerror("Error", "Please select a department")
+                return
+            emp = emp[emp['Dept'] == selected_dept]
+            start_str = gen_start_date_var.get()
+            end_str = gen_end_date_var.get()
+            if start_str and end_str:
+                start = pd.to_datetime(start_str)
+                end = pd.to_datetime(end_str)
+            else:
+                dept_att = att[att['emp_id'].isin(emp['emp_id'])]
+                if len(dept_att) == 0:
+                    messagebox.showinfo("Info", "No attendance records for this department")
+                    return
+                start = dept_att['date'].min()
+                end = dept_att['date'].max()
+            title = f"Attendance Report - Dept: {selected_dept}"
+
+        elif rtype == "Month Wise":
+            try:
+                year = int(month_year_var.get())
+                month_str = month_month_var.get()
+                month = int(month_str.split(' - ')[0])
+            except (ValueError, IndexError):
+                messagebox.showerror("Error", "Please select valid year and month")
+                return
+            start = pd.Timestamp(year, month, 1)
+            end = start + pd.offsets.MonthEnd(1)
+            title = f"Attendance Report - {datetime(year, month, 1).strftime('%B %Y')}"
+
+        elif rtype == "Custom":
+            start_str = gen_start_date_var.get()
+            end_str = gen_end_date_var.get()
+            if not start_str or not end_str:
+                messagebox.showerror("Error", "Please select both From and To dates")
+                return
+            start = pd.to_datetime(start_str)
+            end = pd.to_datetime(end_str)
+            title = "Attendance Report - Custom Range"
+        else:
+            return
+
+        base, all_dates, punch_times = build_attendance_base(emp, att, start, end)
+        save = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf")],
+            title="Save Print Report"
+        )
+        if not save:
+            return
+
+        write_pdf_report(base, all_dates, punch_times, save, title, start, end)
+
+    except Exception as e:
+        messagebox.showerror("Error", f"Print report generation failed: {str(e)}")
+
+
+def write_pdf_report(base, all_dates, punch_times, save_path, title, start, end):
+    """Write a printer-friendly PDF report in A4 landscape mode"""
+    try:
+        page_w, page_h = landscape(A4)
+        doc = SimpleDocTemplate(
+            save_path,
+            pagesize=landscape(A4),
+            leftMargin=10*mm,
+            rightMargin=10*mm,
+            topMargin=12*mm,
+            bottomMargin=12*mm
+        )
+
+        elements = []
+        styles = getSampleStyleSheet()
+
+        # Title
+        title_style = ParagraphStyle(
+            'ReportTitle', parent=styles['Title'],
+            fontSize=14, alignment=TA_CENTER, spaceAfter=4
+        )
+        elements.append(Paragraph(title, title_style))
+
+        # Date range subtitle
+        subtitle = f"Period: {start.strftime('%d-%b-%Y')} to {end.strftime('%d-%b-%Y')}  |  Generated: {datetime.now().strftime('%d-%b-%Y %H:%M')}"
+        sub_style = ParagraphStyle(
+            'Subtitle', parent=styles['Normal'],
+            fontSize=8, alignment=TA_CENTER, spaceAfter=8, textColor=colors.black
+        )
+        elements.append(Paragraph(subtitle, sub_style))
+
+        date_cols = [d.strftime("%Y-%m-%d") for d in all_dates]
+        num_dates = len(date_cols)
+
+        # Compute summary counts per employee
+        summary_data = {}
+        for _, row in base.iterrows():
+            eid = str(row['emp_id'])
+            p_count = sum(1 for c in date_cols if str(row.get(c, '')) == 'P')
+            a_count = sum(1 for c in date_cols if str(row.get(c, '')) == 'A')
+            wo_count = sum(1 for c in date_cols if str(row.get(c, '')) == 'WO')
+            h_count = sum(1 for c in date_cols if str(row.get(c, '')) == 'H')
+            leave_count = sum(1 for c in date_cols if str(row.get(c, '')) in LEAVE_TYPES)
+            summary_data[eid] = (p_count, a_count, wo_count, h_count, leave_count)
+
+        # Build table header
+        header_row1 = ['ID', 'Name', 'Dept']
+        header_row2 = ['', '', '']
+        for d in all_dates:
+            header_row1.append(d.strftime('%d'))
+            header_row2.append(d.strftime('%a')[:2])
+        header_row1 += ['P', 'A', 'WO', 'H', 'LV']
+        header_row2 += ['', '', '', '', '']
+
+        # Build data rows
+        data_rows = [header_row1, header_row2]
+        for _, row in base.iterrows():
+            eid = str(row['emp_id'])
+            data_row = [eid, str(row['name'])[:18], str(row['Dept'])[:10]]
+            for c in date_cols:
+                data_row.append(str(row.get(c, '')))
+            s = summary_data.get(eid, (0, 0, 0, 0, 0))
+            data_row += [str(s[0]), str(s[1]), str(s[2]), str(s[3]), str(s[4])]
+            data_rows.append(data_row)
+
+        # Calculate column widths to fit A4 landscape
+        usable_w = page_w - 20*mm
+        id_w = 32
+        name_w = 62
+        dept_w = 45
+        summary_w = 18
+        fixed_w = id_w + name_w + dept_w + (5 * summary_w)
+        remaining_w = usable_w - fixed_w
+        date_col_w = max(14, remaining_w / max(num_dates, 1))
+
+        col_widths = [id_w, name_w, dept_w]
+        col_widths += [date_col_w] * num_dates
+        col_widths += [summary_w] * 5
+
+        # Auto-scale font
+        if num_dates <= 15:
+            font_size = 7
+        elif num_dates <= 25:
+            font_size = 6
+        else:
+            font_size = 5
+
+        table = Table(data_rows, colWidths=col_widths, repeatRows=2)
+
+        # Black and white table style
+        style_commands = [
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), font_size),
+            ('FONTNAME', (0, 0), (-1, 1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 1), font_size),
+            ('BACKGROUND', (0, 0), (-1, 1), colors.black),
+            ('TEXTCOLOR', (0, 0), (-1, 1), colors.white),
+            ('TEXTCOLOR', (0, 2), (-1, -1), colors.black),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('ALIGN', (1, 2), (1, -1), 'LEFT'),
+            ('ALIGN', (2, 2), (2, -1), 'LEFT'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+            ('LINEBELOW', (0, 1), (-1, 1), 1.2, colors.black),
+            ('ROWBACKGROUNDS', (0, 2), (-1, -1), [colors.white, colors.Color(0.93, 0.93, 0.93)]),
+            ('TOPPADDING', (0, 0), (-1, -1), 1),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
+            ('LEFTPADDING', (0, 0), (-1, -1), 2),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 2),
+            # Vertical line before summary
+            ('LINEAFTER', (2, 0), (2, -1), 1, colors.black),
+            ('LINEBEFORE', (3 + num_dates, 0), (3 + num_dates, -1), 1, colors.black),
+            # Bold summary columns
+            ('FONTNAME', (3 + num_dates, 2), (-1, -1), 'Helvetica-Bold'),
+        ]
+
+        table.setStyle(TableStyle(style_commands))
+        elements.append(table)
+
+        # Legend
+        elements.append(Spacer(1, 6*mm))
+        legend_style = ParagraphStyle(
+            'Legend', parent=styles['Normal'],
+            fontSize=7, textColor=colors.black, alignment=TA_LEFT
+        )
+        legend_text = ("<b>Legend:</b>  P = Present  |  A = Absent  |  WO = Weekly Off  |  "
+                       "H = Holiday  |  LV = Total Leaves (EL, CL, COFF, DL, ML, HD, CC, MaL, RH)")
+        elements.append(Paragraph(legend_text, legend_style))
+
+        # Build with page numbers
+        def add_page_number(canvas, doc):
+            canvas.saveState()
+            canvas.setFont('Helvetica', 7)
+            canvas.setFillColor(colors.black)
+            canvas.drawRightString(
+                page_w - 10*mm, 7*mm,
+                f"Page {doc.page}"
+            )
+            canvas.drawString(
+                10*mm, 7*mm,
+                "IOP Attendance Report"
+            )
+            canvas.restoreState()
+
+        doc.build(elements, onFirstPage=add_page_number, onLaterPages=add_page_number)
+        messagebox.showinfo("Success", f"Print report generated successfully!\n{save_path}")
+
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to generate print report: {str(e)}")
+
+
 # ================ EDITOR FUNCTIONS ================
 
 def verify_pin():
@@ -995,7 +1251,7 @@ def save_all_edits():
 # ================ GUI SETUP ================
 
 app = tk.Tk()
-app.title("HRMS")
+app.title("IOP Attendance Generator")
 app.geometry("900x700")
 
 notebook = ttk.Notebook(app)
@@ -1196,8 +1452,13 @@ gen_end_date_entry = DateEntry(custom_date_frame, textvariable=gen_end_date_var,
 gen_end_date_entry.delete(0, 'end')
 gen_end_date_entry.pack(side="left", padx=5)
 
-tk.Button(tab_generate, text="📊  Generate Report", command=generate_report, bg="#673AB7", fg="white",
-          font=("Arial", 14, "bold"), padx=30, pady=10).pack(pady=30)
+gen_btn_frame = tk.Frame(tab_generate)
+gen_btn_frame.pack(pady=30)
+
+tk.Button(gen_btn_frame, text="📊  Generate Report", command=generate_report, bg="#673AB7", fg="white",
+          font=("Arial", 14, "bold"), padx=30, pady=10).pack(side="left", padx=10)
+tk.Button(gen_btn_frame, text="🖨  Print Report", command=generate_print_report, bg="#00796B", fg="white",
+          font=("Arial", 14, "bold"), padx=30, pady=10).pack(side="left", padx=10)
 
 tk.Label(tab_generate, text="Select report type, fill in options, and click Generate.\nEdited attendance data will be reflected in reports.", 
          font=("Arial", 10), fg="#666", justify="center").pack(pady=10)
@@ -1206,6 +1467,6 @@ report_type_var.trace_add("write", on_report_type_change)
 on_report_type_change()
 
 # Footer
-tk.Label(app, text="Developed & Designed @ CMS Lab by Sidhartha Sahu ", font=("Times New Roman", 12), fg="#999").pack(side="bottom", pady=2)
+tk.Label(app, text="Developed & Designed @ HEPD Lab by SIDHARTHA SAHU", font=("Times New Roman", 12), fg="#999").pack(side="bottom", pady=2)
 
 app.mainloop()
